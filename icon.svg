@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Feishu bot">
+  <defs>
+    <linearGradient id="fb" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a7bff"/>
+      <stop offset="1" stop-color="#1c3f9e"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#fb)"/>
+  <path d="M17 18h30a7 7 0 0 1 7 7v13a7 7 0 0 1-7 7H31l-9 8v-8h-5a7 7 0 0 1-7-7V25a7 7 0 0 1 7-7z" fill="#ffffff" opacity="0.95"/>
+  <path d="M25 27l6.5 5-6.5 5" fill="none" stroke="#2b63e0" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="35" y="34" width="11" height="3.6" rx="1.8" fill="#2b63e0"/>
+</svg>

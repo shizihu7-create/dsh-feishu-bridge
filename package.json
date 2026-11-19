@@ -1,0 +1,57 @@
+{
+  "name": "dsh-feishu-bridge",
+  "version": "0.1.0",
+  "description": "用飞书群/单聊机器人操作 DeepSeek Harness：手机发消息、看流式卡片、点审批。长连接免公网。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "shizihu7-create",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shizihu7-create/dsh-feishu-bridge.git"
+  },
+  "homepage": "https://github.com/shizihu7-create/dsh-feishu-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/shizihu7-create/dsh-feishu-bridge/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "feishu",
+    "lark",
+    "bot",
+    "im",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test/dry-run.mjs",
+    "live-check": "node test/live-check.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.76.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

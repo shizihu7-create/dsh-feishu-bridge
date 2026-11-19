@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Feishu bot",
+    "description": "Drive DSH from a Feishu group bot: send messages from your phone, watch a streaming card, and tap approvals. Uses Feishu's long connection, so no public endpoint is needed.",
+    "detail": "docs/DETAIL.md"
+  }
+}
