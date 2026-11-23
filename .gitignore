@@ -1,6 +1,7 @@
 node_modules/
 test/.home/
 .feishu-uploads/
+.feishu-outbox/
 *.log
 .DS_Store
 Thumbs.db

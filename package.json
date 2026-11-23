@@ -1,6 +1,6 @@
 {
   "name": "dsh-feishu-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "用飞书群/单聊机器人操作 DeepSeek Harness：手机发消息、看流式卡片、点审批。长连接免公网。",
   "type": "module",
   "main": "index.js",

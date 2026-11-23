@@ -2,7 +2,7 @@
  * Offline dry run: exercises the DSH wiring with fake services and a fake
  * Feishu transport. No network, no real bot, no real Session.
  */
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FeishuBridge } from '../lib/bridge.js';
@@ -21,7 +21,7 @@ function check(name, condition, detail) {
 }
 
 const listeners = new Map();
-const calls = { prompt: [], created: [], patched: [], sent: [], cancelled: [], selected: [], downloads: [] };
+const calls = { prompt: [], created: [], patched: [], sent: [], cancelled: [], selected: [], downloads: [], uploads: [], files: [] };
 
 const services = {
   commands: {
@@ -55,6 +55,16 @@ const services = {
       };
     },
     async selectModel(request) { calls.selected.push(request); return { selected: request }; },
+    async state(request) {
+      return {
+        sessionId: request.sessionId,
+        cursor: 0,
+        active: true,
+        running: request.sessionId === 'session-running',
+        queue: [],
+        pendingInput: [],
+      };
+    },
   },
   workingDirectory: { defaultDirectory: 'C:\\Users\\Lenovo\\.dsh\\profiles\\desktop' },
   workspaceRegistry: {
@@ -76,7 +86,7 @@ const transport = {
   bot: { open_id: 'ou_bot', app_name: '测试机器人' },
   async replyCard(messageId, chatId, card) { calls.patched.push({ kind: 'reply', card }); return `om_card_${calls.patched.length}`; },
   async sendCard(chatId, card) { calls.patched.push({ kind: 'send', card }); return `om_sent_${calls.patched.length}`; },
-  async patchCard(messageId, card) { calls.patched.push({ kind: 'patch', card }); return undefined; },
+  async patchCard(messageId, card) { calls.patched.push({ kind: 'patch', messageId, card }); return undefined; },
   async sendText(chatId, text) { calls.sent.push(text); return 'om_text'; },
   async downloadResource(messageId, fileKey, type) {
     calls.downloads.push({ messageId, fileKey, type });
@@ -86,6 +96,18 @@ const transport = {
       return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
     return Buffer.from('hello from feishu');
+  },
+  async uploadFile(name, bytes) {
+    calls.uploads.push({ name, size: bytes.length, text: bytes.toString() });
+    return `file_key_${calls.uploads.length}`;
+  },
+  async replyFile(messageId, chatId, fileKey) {
+    calls.files.push({ messageId, chatId, fileKey });
+    return 'om_file_sent';
+  },
+  async sendFile(chatId, fileKey) {
+    calls.files.push({ messageId: undefined, chatId, fileKey });
+    return 'om_file_sent';
   },
   describe() { return { state: 'ready', bot: this.bot }; },
   stop() {},
@@ -108,9 +130,11 @@ function buttonValues(card) {
 const tick = (ms = 30) => new Promise((resolve) => { setTimeout(resolve, ms); });
 /** Stop the card-refresh loops a prompt opens, so later assertions read the latest deliberate card. */
 const clearTurns = () => {
-  for (const state of bridge.active.values()) {
-    if (state.timer !== undefined) clearInterval(state.timer);
-    state.finished = true;
+  for (const queue of bridge.active.values()) {
+    for (const state of queue) {
+      if (state.timer !== undefined) clearInterval(state.timer);
+      state.finished = true;
+    }
   }
   bridge.active.clear();
 };
@@ -365,6 +389,343 @@ check('/use rebinds the chat', bridge.store.data.bindings.oc_chat?.sessionId ===
 console.log('10. desktop command');
 const statusResult = await services.command.handler({ rawInput: 'status' });
 check('/feishu status answers', statusResult?.kind === 'success' && statusResult.text.includes('App ID'));
+
+console.log('12. two messages on one session keep two cards');
+clearTurns();
+const boundSession = bridge.store.data.bindings.oc_chat.sessionId;
+const bound = { header: { id: boundSession } };
+const settledBefore = calls.patched.filter(entry => entry.kind === 'patch' && JSON.stringify(entry.card).includes('DSH · 完成')).length;
+const promptBefore = calls.prompt.length;
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_two_1', content: JSON.stringify({ text: '@_user_1 第一条' }) },
+});
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_two_2', content: JSON.stringify({ text: '@_user_1 第二条' }) },
+});
+await tick(40);
+const queued = bridge.active.get(boundSession);
+check('both prompts delivered', calls.prompt.length === promptBefore + 2);
+check('two turn states queued', Array.isArray(queued) && queued.length === 2, String(queued?.length));
+check('the second card is marked queued', queued?.[1]?.queued === true);
+
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 1 } });
+listeners.get('session/event')(bound, { type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '回复一' }] } } });
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+await tick(50);
+check('first state settled, one left', bridge.active.get(boundSession)?.length === 1);
+check('the queued card was promoted', bridge.active.get(boundSession)?.[0]?.queued === false);
+
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 2 } });
+listeners.get('session/event')(bound, { type: 'assistant/message', data: { turn: 2, step: 2, message: { content: [{ type: 'text', text: '回复二' }] } } });
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } });
+await tick(50);
+check('no zombie turn state', (bridge.active.get(boundSession) ?? []).length === 0);
+const settledAfter = calls.patched.filter(entry => entry.kind === 'patch' && JSON.stringify(entry.card).includes('DSH · 完成')).length;
+check('both cards settled', settledAfter - settledBefore === 2, `${settledAfter - settledBefore}`);
+
+console.log('13. leftover cards settle on the next start');
+const { Store } = await import('../lib/state.js');
+const leftover = new Store(ctx.logger);
+leftover.load();
+leftover.addInflight({ cardId: 'om_stale_1', chatId: 'oc_chat', quote: '旧消息', startedAt: Date.now() - 60000 });
+const quietCtx = {
+  logger: ctx.logger,
+  get: (name) => (name === 'commands' ? { register: () => () => {} } : undefined),
+  on: () => () => {},
+};
+const restarted = new FeishuBridge(quietCtx);
+restarted.transport = transport;
+await restarted.start();
+await tick(30);
+check(
+  'stale card repainted as interrupted',
+  calls.patched.some(entry => entry.kind === 'patch' && JSON.stringify(entry.card).includes('已中断')),
+);
+check('stale records cleared', (new Store(ctx.logger)).load().inflight?.length === 0);
+restarted.dispose();
+
+console.log('13b. a reload leaves a still-running turn alone');
+const reloadStore = new Store(ctx.logger);
+reloadStore.load();
+reloadStore.addInflight({ cardId: 'om_running_card', chatId: 'oc_chat', sessionId: 'session-running', quote: '跑着的', startedAt: Date.now() });
+reloadStore.addInflight({ cardId: 'om_stopped_card', chatId: 'oc_chat', sessionId: 'session-stopped', quote: '停了的', startedAt: Date.now() });
+const reloadListeners = new Map();
+const reloadCtx = {
+  logger: ctx.logger,
+  get: (name) => {
+    if (name === 'sessionController') return services.sessionController;
+    if (name === 'commands') return { register: () => () => {} };
+    return undefined;
+  },
+  on: (name, listener) => {
+    reloadListeners.set(name, listener);
+    return () => { reloadListeners.delete(name); };
+  },
+};
+const reloadedBridge = new FeishuBridge(reloadCtx);
+reloadedBridge.transport = transport;
+await reloadedBridge.start();
+await tick(40);
+check(
+  'running turn is not repainted as interrupted',
+  !calls.patched.some(entry => entry.kind === 'patch' && entry.messageId === 'om_running_card'),
+);
+check(
+  'stopped turn is repainted',
+  calls.patched.some(entry => entry.kind === 'patch' && entry.messageId === 'om_stopped_card' && JSON.stringify(entry.card).includes('已中断')),
+);
+reloadListeners.get('session/event')({ header: { id: 'session-running' } }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+await tick(40);
+check(
+  'a readopted card settles when its turn ends',
+  calls.patched.some(entry => entry.kind === 'patch' && entry.messageId === 'om_running_card' && JSON.stringify(entry.card).includes('已结束')),
+);
+reloadedBridge.dispose();
+
+console.log('14. a broken card falls back to plain text');
+const originalPatch = transport.patchCard;
+transport.patchCard = async () => { throw new Error('patch refused'); };
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_broken_1', content: JSON.stringify({ text: '@_user_1 兜底测试' }) },
+});
+await tick(40);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 9 } });
+listeners.get('session/event')(bound, { type: 'assistant/message', data: { turn: 9, step: 9, message: { content: [{ type: 'text', text: '兜底回答' }] } } });
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 9, reason: { kind: 'completed' } } });
+await tick(80);
+check('answer delivered as text when the card cannot be updated', calls.sent.some(text => text.includes('兜底回答')), JSON.stringify(calls.sent.slice(-2)));
+transport.patchCard = originalPatch;
+
+console.log('15. /send delivers a workspace file');
+writeFileSync(join(workspace, 'report.txt'), 'outbound payload');
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_send_1', content: JSON.stringify({ text: '@_user_1 /send report.txt' }) },
+});
+await tick(40);
+check('file uploaded with its bytes', calls.uploads.at(-1)?.name === 'report.txt' && calls.uploads.at(-1)?.text === 'outbound payload');
+check('file message sent', typeof calls.files.at(-1)?.fileKey === 'string' && calls.files.at(-1).fileKey.startsWith('file_key_'));
+
+const uploadsBefore = calls.uploads.length;
+const outside = join(workspace, '..', `outside-secret-${Date.now()}.txt`);
+writeFileSync(outside, 'must not leave the workspace');
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_send_2', content: JSON.stringify({ text: `@_user_1 /send ../${outside.split(/[\\/]/).pop()}` }) },
+});
+await tick(40);
+check('path traversal refused', calls.uploads.length === uploadsBefore);
+check('refusal explains the rule', JSON.stringify(calls.patched.at(-1)?.card ?? {}).includes('只能发送'));
+rmSync(outside, { force: true });
+
+console.log('16. files marked with present are sent when the turn settles');
+const uploadsBeforePresented = calls.uploads.length;
+const filesBeforePresented = calls.files.length;
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_present_1', content: JSON.stringify({ text: '@_user_1 改一下 report.txt' }) },
+});
+await tick(40);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 11 } });
+listeners.get('session/event')(bound, {
+  type: 'tool/call',
+  data: {
+    turn: 11,
+    step: 1,
+    callId: 'c-present-1',
+    name: 'present',
+    arguments: JSON.stringify({ files: [{ path: 'report.txt', description: '改好的文件' }] }),
+  },
+});
+listeners.get('session/event')(bound, {
+  type: 'assistant/message',
+  data: { turn: 11, step: 1, message: { content: [{ type: 'text', text: '改好了' }] } },
+});
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 11, reason: { kind: 'completed' } } });
+await tick(150);
+check(
+  'presented file uploaded',
+  calls.uploads.length === uploadsBeforePresented + 1 && calls.uploads.at(-1)?.name === 'report.txt',
+  JSON.stringify(calls.uploads.at(-1)),
+);
+check('presented file replied under the request', calls.files.length === filesBeforePresented + 1);
+
+console.log('17. a presented path outside the workspace is refused');
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_present_2', content: JSON.stringify({ text: '@_user_1 再改一份' }) },
+});
+await tick(40);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 12 } });
+listeners.get('session/event')(bound, {
+  type: 'tool/call',
+  data: {
+    turn: 12,
+    step: 1,
+    callId: 'c-present-2',
+    name: 'present',
+    arguments: JSON.stringify({ files: [{ path: '../outside-secret.txt' }] }),
+  },
+});
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 12, reason: { kind: 'completed' } } });
+await tick(150);
+check('outside path is not uploaded', calls.uploads.length === uploadsBeforePresented + 1);
+check('a note explains the failure', calls.sent.some(text => text.includes('没能发送')), JSON.stringify(calls.sent.slice(-1)));
+
+console.log('18. a desktop turn in a bound session sends nothing');
+const uploadsBeforeExternal = calls.uploads.length;
+const filesBeforeExternal = calls.files.length;
+// No deliver(): this turn runs in the host, like a desktop continuation.
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 13 } });
+listeners.get('session/event')(bound, {
+  type: 'tool/call',
+  data: { turn: 13, step: 1, callId: 'c-ext-1', name: 'present', arguments: JSON.stringify({ files: [{ path: 'report.txt' }] }) },
+});
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 13, reason: { kind: 'completed' } } });
+await tick(150);
+check('desktop turn does not upload', calls.uploads.length === uploadsBeforeExternal);
+check('desktop turn does not send a file message', calls.files.length === filesBeforeExternal);
+
+console.log('19. an unbound session sends nothing');
+const uploadsBeforeUnbound = calls.uploads.length;
+const loose = { header: { id: 'session-unbound' } };
+listeners.get('session/event')(loose, {
+  type: 'tool/call',
+  data: { turn: 1, step: 1, callId: 'c-x', name: 'present', arguments: JSON.stringify({ files: [{ path: 'report.txt' }] }) },
+});
+listeners.get('session/event')(loose, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+await tick(100);
+check('unbound session does not send', calls.uploads.length === uploadsBeforeUnbound);
+
+console.log('20. cards name the session and offer a stop button');
+clearTurns();
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_card_1', content: JSON.stringify({ text: '@_user_1 卡片测试' }) },
+});
+await tick(60);
+const namedCard = calls.patched.at(-1)?.card;
+check('card title names the session', JSON.stringify(namedCard).includes('另一个会话'), JSON.stringify(namedCard)?.slice(0, 140));
+const stopButton = buttonValues(namedCard).find(value => value.t === 'stop');
+check('running card offers a stop button', stopButton !== undefined);
+const stopToast = bridge.onCardAction({ event: { operator: { open_id: 'ou_owner' }, action: { value: stopButton } } });
+check(
+  'stop button cancels the bound session',
+  stopToast?.toast?.type === 'success' && calls.cancelled.at(-1)?.sessionId === boundSession,
+  JSON.stringify(stopToast),
+);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 21 } });
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 21, reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+await tick(80);
+check('an aborted turn settles as stopped', JSON.stringify(calls.patched.at(-1)?.card ?? {}).includes('已停止'));
+
+console.log('21. a long answer becomes a markdown file');
+bridge.store.data.settings.maxCardChars = 400;
+bridge.store.data.settings.cardSummaryChars = 120;
+const uploadsBeforeLong = calls.uploads.length;
+const filesBeforeLong = calls.files.length;
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_long_1', content: JSON.stringify({ text: '@_user_1 写长一点' }) },
+});
+await tick(40);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 31 } });
+listeners.get('session/event')(bound, {
+  type: 'assistant/message',
+  data: { turn: 31, step: 1, message: { content: [{ type: 'text', text: '长'.repeat(1000) }] } },
+});
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 31, reason: { kind: 'completed' } } });
+await tick(150);
+const uploadedLong = calls.uploads.at(-1);
+check(
+  'long answer uploaded as markdown',
+  calls.uploads.length === uploadsBeforeLong + 1 && /^回复-.*\.md$/.test(uploadedLong?.name ?? ''),
+  JSON.stringify(uploadedLong?.name),
+);
+check('long answer replied as a file', calls.files.length === filesBeforeLong + 1);
+const longCard = calls.patched.at(-1)?.card;
+check(
+  'card keeps a summary and points at the file',
+  JSON.stringify(longCard).includes('作为文件发送'),
+  JSON.stringify(longCard)?.slice(0, 160),
+);
+bridge.store.data.settings.maxCardChars = 9000;
+bridge.store.data.settings.cardSummaryChars = 1500;
+
+console.log('22. a failed turn shows the provider code');
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_fail_1', content: JSON.stringify({ text: '@_user_1 失败的回合' }) },
+});
+await tick(40);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 32 } });
+listeners.get('session/event')(bound, {
+  type: 'turn/end',
+  data: { turn: 32, reason: { kind: 'error', error: { message: 'rate limited', code: 'RATE_LIMIT', status: 429 } } },
+});
+await tick(120);
+const failedCard = calls.patched.at(-1)?.card;
+check(
+  'failure names the code and status',
+  JSON.stringify(failedCard).includes('RATE_LIMIT') && JSON.stringify(failedCard).includes('429'),
+  JSON.stringify(failedCard)?.slice(0, 200),
+);
+
+console.log('23. long turns ping the phone, quick ones stay quiet');
+clearTurns();
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_notify_1', content: JSON.stringify({ text: '@_user_1 快问快答' }) },
+});
+await tick(40);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 41 } });
+listeners.get('session/event')(bound, {
+  type: 'assistant/message',
+  data: { turn: 41, step: 1, message: { content: [{ type: 'text', text: '很快的回答' }] } },
+});
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 41, reason: { kind: 'completed' } } });
+await tick(140);
+check('quick turn sends no notice', !calls.sent.some(text => text.includes('✅ 完成')));
+
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_notify_2', content: JSON.stringify({ text: '@_user_1 慢任务' }) },
+});
+await tick(40);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 42 } });
+const slow = bridge.active.get(boundSession);
+if (slow?.[0]) slow[0].startedAt = Date.now() - 60000;
+listeners.get('session/event')(bound, {
+  type: 'assistant/message',
+  data: { turn: 42, step: 1, message: { content: [{ type: 'text', text: '慢回答' }] } },
+});
+listeners.get('session/event')(bound, { type: 'turn/end', data: { turn: 42, reason: { kind: 'completed' } } });
+await tick(160);
+check(
+  'slow turn sends a finish notice',
+  calls.sent.some(text => text.includes('✅ 完成') && text.includes('慢回答')),
+  JSON.stringify(calls.sent.at(-1)),
+);
+
+await bridge.onInbound({
+  sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+  message: { ...first.message, message_id: 'om_notify_3', content: JSON.stringify({ text: '@_user_1 失败快答' }) },
+});
+await tick(40);
+listeners.get('session/event')(bound, { type: 'turn/start', data: { turn: 43 } });
+listeners.get('session/event')(bound, {
+  type: 'turn/end',
+  data: { turn: 43, reason: { kind: 'error', error: { message: 'gateway down', code: 'GATEWAY', status: 502 } } },
+});
+await tick(160);
+check(
+  'a failure notifies even when quick',
+  calls.sent.some(text => text.includes('⚠️ 失败') && text.includes('GATEWAY')),
+  JSON.stringify(calls.sent.at(-1)),
+);
 
 console.log('11. teardown');
 bridge.dispose();

@@ -6,20 +6,22 @@
 ## 它做了什么
 
 - **收消息**：`im.message.receive_v1` → 去掉 @ 指令后投进绑定会话（`sessionController.prompt`，冷会话会自动唤醒）。
-- **发过程**：一轮里用一张卡片按约 1.2 秒节流刷新，显示当前工具调用与正文；卡片定稿后不再更新。
+- **发过程**：一轮里用一张卡片按约 1.2 秒节流刷新，显示当前工具调用与正文；卡片标题带会话名，处理中卡片底部有「停止」按钮（等价 `/stop`）。
 - **审批**：`approval/request` 瀑布事件，只在「飞书绑定的会话」里接管，卡片按钮「允许一次 / 拒绝」；超时（默认 5 分钟）自动交回桌面端。
 - **提问**：`user-questions/request` 同理，选项变成按钮。
-- **命令**：`/new`、`/ls`、`/use`、`/stop`、`/status`、`/model`、`/help`。
-- **附件**：手机发来的图片直接进入模型上下文；文件保存到会话工作目录的 `.feishu-uploads/`，并把绝对路径告诉模型。
+- **命令**：`/new`、`/ls`、`/use`、`/stop`、`/status`、`/model`、`/send`、`/help`。
+- **附件**：手机发来的图片直接进入模型上下文；文件保存到会话工作目录的 `.feishu-uploads/`，并把绝对路径告诉模型。反方向：代理用 `present` 声明的交付物会在回合结束时自动发回，也可用 `/send <路径>` 手动发。
 
 ## 第一次使用
 
 1. 在飞书开放平台创建企业自建应用，添加**机器人**能力。
 2. 权限（缺一个都会报错，按需开）：
-   - `im:message`（获取与发送单聊、群组消息）
+   - `im:message` 或 `im:message:readonly`（读消息、下载消息里的图片/文件）
+   - `im:message.p2p_msg`（接收单聊消息）
    - `im:message.group_at_msg`（接收群聊中 @ 机器人消息）
    - `im:message:send_as_bot`（以应用身份发消息）
-   - `im:chat:readonly`（读群信息，用于判断是否 @ 了机器人）
+   - `im:resource:upload` 或 `im:resource`（上传文件：`/send`、`present` 自动发送、长回复转文件）
+   - `im:chat:readonly`（可选，读群信息）
 3. 事件订阅：`im.message.receive_v1`；回调订阅（「回调配置」页签）：`card.action.trigger`。
 4. **订阅方式选「使用长连接接收事件」**，不要填请求地址。
 5. 创建版本并发布，把机器人拉进目标群。
@@ -43,6 +45,7 @@
 | `/stop` | 中断当前回合 |
 | `/status` | 连接状态、绑定、模型 |
 | `/model` / `/model <序号>` | 查看 / 切换本会话模型 |
+| `/send <路径>` | 把会话工作区里的文件发回手机 |
 | 回「允许」/「拒绝」 | 审批按钮不可用时的文字兜底 |
 
 桌面端还有一个管理命令：`/feishu status`、`/feishu setup <AppID> <AppSecret>`、`/feishu disconnect`、`/feishu reset`。
@@ -65,16 +68,34 @@
 | 图片（PNG/JPEG/WebP/GIF，≤20 MB） | 下载后作为 prompt 的 image part，模型直接看图 |
 | 文件（≤50 MB） | 保存到 `<会话工作目录>/.feishu-uploads/<时间戳>-<原名>`，prompt 里给出绝对路径 |
 | 图文混排（`post`） | 文字原样进 prompt，其中的图片同样进上下文，视频/媒体按文件落盘 |
+| 出站 `/send <路径>` | 把工作区（含子目录）里的文件上传并作为文件消息发回当前 chat，≤30 MB |
+| 出站（自动） | 代理用 `present` 声明交付物时，**从飞书发起的回合**结束自动发送，≤30 MB；回到桌面端继续同一会话则不发送。`settings.autoSendPresented` 可关 |
+| 长回复 | 超过 `maxCardChars` 的回复，卡片只留 `cardSummaryChars` 摘要，完整内容写入 `.feishu-outbox/` 并作为 `.md` 发回 |
+| 完成提醒 | 超过 `notifyAfterMs`（默认 20 秒）的回合、以及任何失败，会补发一条短文本——飞书对卡片更新不通知，只有新消息才提醒 |
 
 - 图片走附件库（`attachments.admitPromptContent`），不落盘，模型能看到，但**不能**用 `read` 工具再读一次。
 - 文件落盘，模型用 `read`、`bash` 等工具处理；工作目录外的路径受沙箱限制。
 - 超过上限、格式不支持、下载失败都会回一张说明卡，不会静默丢弃。
-- `.feishu-uploads/` 建议加进 `.gitignore`。
+- `.feishu-uploads/` 与 `.feishu-outbox/` 建议加进 `.gitignore`。
 - 群聊里单独发图片/文件通常**没有 @ 提及**，`im:message.group_at_msg` 不会触发，所以附件主要工作在单聊；群里要发附件，目前只能先把文件发到单聊，再用 `/use` 关联同一个会话。
 
 ## 已知限制
 
 - 手机能用 = 这台电脑开着 DSH；休眠或退出后长连接断开，恢复后会重连。
 - 审批只有一个应答方：飞书绑定的会话，审批只出现在飞书卡片上，桌面 GUI 这次看不到。
-- 卡片更新受飞书限流（单条 5 QPS），所以是节流刷新而不是逐字流式；超长回复自动分段。
-- 暂不支持：语音消息、DSH → 手机发送图片或文件。
+- 卡片更新受飞书限流（单条 5 QPS），所以是节流刷新而不是逐字流式；超长回复转成 `.md` 文件
+- 暂不支持：语音消息、DSH → 手机的图片消息。
+
+## 配置
+
+设置都在状态文件的 `settings` 下，改完重启生效：
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `flushIntervalMs` | 1200 | 卡片刷新节流（毫秒） |
+| `approvalTimeoutMs` / `questionTimeoutMs` | 300000 / 240000 | 审批、提问在手机上的等待上限 |
+| `maxCardChars` / `cardSummaryChars` | 9000 / 1500 | 超过阈值转文件；卡片保留的摘要长度 |
+| `maxImageBytes` / `maxFileBytes` | 20 MB / 50 MB | 入站附件上限 |
+| `maxOutboundBytes` | 30 MB | 出站上限（飞书限制） |
+| `autoSendPresented` | `true` | `present` 交付物自动发送 |
+| `notifyAfterMs` | 20000 | 完成提醒阈值，`0` 表示每轮都提醒 |
